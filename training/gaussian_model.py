@@ -40,8 +40,15 @@ class GaussianModel(nn.Module):
         # Positions: random in [-1, 1]^3
         self.means.data.uniform_(-1.0, 1.0)
 
-        # Scales: log-space, start small
-        self.scales_raw.data.uniform_(-4.0, -2.0)  # exp(-4) ~ 0.018, exp(-2) ~ 0.135
+        # Scales: exponential dropoff — a few large, most small.
+        # Rank splats 0..n-1, give each a scale proportional to exp(-rank).
+        # Splat 0: scale ~3.0 (covers whole scene), splat n-1: scale ~0.02
+        ranks = torch.arange(n, device=device, dtype=torch.float32)
+        log_scales = torch.log(torch.tensor(3.0)) - ranks * (torch.log(torch.tensor(3.0 / 0.02)) / max(n - 1, 1))
+        # Shuffle so large splats aren't always at index 0
+        perm = torch.randperm(n, device=device)
+        log_scales = log_scales[perm]
+        self.scales_raw.data = log_scales.unsqueeze(-1).expand(n, 3).clone()
 
         # Quaternions: near identity [1, 0, 0, 0] with noise
         self.quats_raw.data[:, 0] = 1.0
