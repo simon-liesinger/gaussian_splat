@@ -5,3 +5,7 @@ output/
 *.ply
 *.pt
 .env
+.build/
+.swiftpm/
+mac-viewer/.build/
+mac-viewer/_model.ply

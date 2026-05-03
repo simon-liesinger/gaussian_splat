@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Gaussian Splat Viewer</title>
+    <style>
+        * { margin: 0; padding: 0; }
+        body { background: #1a1a1a; overflow: hidden; font-family: system-ui; }
+        canvas { display: block; width: 100vw; height: 100vh; }
+        #info {
+            position: fixed; top: 10px; right: 10px;
+            color: #ccc; font-size: 13px;
+            background: rgba(0,0,0,0.6); padding: 8px 12px;
+            border-radius: 6px; pointer-events: none;
+        }
+        #controls {
+            position: fixed; bottom: 10px; left: 50%;
+            transform: translateX(-50%);
+            color: rgba(255,255,255,0.4); font-size: 11px;
+            background: rgba(0,0,0,0.3); padding: 4px 12px;
+            border-radius: 4px; pointer-events: none;
+        }
+        #dropzone {
+            position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+            display: flex; align-items: center; justify-content: center;
+            color: white; font-size: 24px;
+        }
+        #dropzone.hidden { display: none; }
+        #loading {
+            position: fixed; top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            color: white; font-size: 16px;
+        }
+        #loading.hidden { display: none; }
+    </style>
+</head>
+<body>
+    <div id="dropzone">
+        <div style="text-align: center">
+            <div style="font-size: 64px; margin-bottom: 20px;">&#x1F4E6;</div>
+            <div>Drop a .ply file here</div>
+            <div style="font-size: 14px; color: #888; margin-top: 8px;">or use ?url=path/to/model.ply</div>
+        </div>
+    </div>
+    <div id="loading" class="hidden">Loading...</div>
+    <canvas id="canvas"></canvas>
+    <div id="info"></div>
+    <div id="controls">Drag: orbit | Scroll: zoom | Right-drag: pan</div>
+
+    <script type="module">
+    // Minimal gaussian splat WebGL renderer
+    // Based on the approach from antimatter15/splat
+
+    const canvas = document.getElementById('canvas');
+    const gl = canvas.getContext('webgl2', { antialias: false });
+    const info = document.getElementById('info');
+    const dropzone = document.getElementById('dropzone');
+    const loading = document.getElementById('loading');
+
+    if (!gl) {
+        dropzone.innerHTML = '<div>WebGL2 not supported</div>';
+        throw new Error('WebGL2 required');
+    }
+
+    // Camera state
+    let camX = 0, camY = 0, camZ = 5;
+    let yaw = 0, pitch = 0;
+    let isDragging = false, isRightDrag = false;
+    let lastX = 0, lastY = 0;
+
+    // Mouse controls
+    canvas.addEventListener('mousedown', e => {
+        isDragging = true;
+        isRightDrag = e.button === 2 || e.ctrlKey;
+        lastX = e.clientX; lastY = e.clientY;
+        e.preventDefault();
+    });
+    window.addEventListener('mouseup', () => isDragging = false);
+    window.addEventListener('mousemove', e => {
+        if (!isDragging) return;
+        const dx = e.clientX - lastX, dy = e.clientY - lastY;
+        lastX = e.clientX; lastY = e.clientY;
+        if (isRightDrag) {
+            camX -= dx * 0.01;
+            camY += dy * 0.01;
+        } else {
+            yaw += dx * 0.005;
+            pitch += dy * 0.005;
+            pitch = Math.max(-Math.PI/2 + 0.01, Math.min(Math.PI/2 - 0.01, pitch));
+        }
+    });
+    canvas.addEventListener('wheel', e => {
+        camZ *= 1 + e.deltaY * 0.001;
+        camZ = Math.max(0.1, Math.min(100, camZ));
+        e.preventDefault();
+    }, { passive: false });
+    canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+    // Resize
+    function resize() {
+        canvas.width = window.innerWidth * devicePixelRatio;
+        canvas.height = window.innerHeight * devicePixelRatio;
+        gl.viewport(0, 0, canvas.width, canvas.height);
+    }
+    window.addEventListener('resize', resize);
+    resize();
+
+    // Shaders for rendering sorted splats as quads
+    const vertSrc = `#version 300 es
+    precision highp float;
+    uniform mat4 projection, view;
+    uniform vec2 viewport;
+    uniform vec2 focal;
+    in vec3 position;
+    in vec3 color;
+    in float opacity;
+    in vec3 scale;
+    in vec4 quat;
+    in vec2 quadOffset;
+    out vec4 vColor;
+    out vec2 vOffset;
+
+    mat3 quatToMat(vec4 q) {
+        float x=q.x, y=q.y, z=q.z, w=q.w;
+        return mat3(
+            1.-2.*(y*y+z*z), 2.*(x*y+w*z), 2.*(x*z-w*y),
+            2.*(x*y-w*z), 1.-2.*(x*x+z*z), 2.*(y*z+w*x),
+            2.*(x*z+w*y), 2.*(y*z-w*x), 1.-2.*(x*x+y*y)
+        );
+    }
+
+    void main() {
+        vec4 camPos = view * vec4(position, 1.0);
+        if (camPos.z < 0.1) { gl_Position = vec4(0,0,2,1); return; }
+
+        mat3 R = quatToMat(quat);
+        mat3 S = mat3(scale.x,0,0, 0,scale.y,0, 0,0,scale.z);
+        mat3 M = R * S;
+        mat3 Sigma = M * transpose(M);
+
+        mat3 V3 = mat3(view);
+        mat3 cov3d_cam = V3 * Sigma * transpose(V3);
+
+        float fx = focal.x, fy = focal.y;
+        float z = camPos.z;
+        float z2 = z * z;
+
+        // Project 3D covariance to 2D
+        float a = fx*fx/z2 * cov3d_cam[0][0] + 2.0*fx*fy/(z2) * cov3d_cam[0][1] + fy*fy/z2 * cov3d_cam[1][1];
+        float b = fx*fx/z2 * cov3d_cam[0][1] + fy*fy/z2 * cov3d_cam[1][2];
+        // Simplified: just use the diagonal
+        float sx = sqrt(max(cov3d_cam[0][0], 0.0001)) * fx / z * 2.0;
+        float sy = sqrt(max(cov3d_cam[1][1], 0.0001)) * fy / z * 2.0;
+
+        vec4 projected = projection * camPos;
+        projected /= projected.w;
+
+        gl_Position = vec4(
+            projected.xy + quadOffset * vec2(sx, sy) / viewport,
+            projected.z, 1.0
+        );
+
+        float alpha = opacity * exp(-0.5 * dot(quadOffset, quadOffset));
+        vColor = vec4(color, alpha);
+        vOffset = quadOffset;
+    }`;
+
+    const fragSrc = `#version 300 es
+    precision highp float;
+    in vec4 vColor;
+    in vec2 vOffset;
+    out vec4 fragColor;
+    void main() {
+        float w = exp(-0.5 * dot(vOffset, vOffset));
+        fragColor = vec4(vColor.rgb, vColor.a * w);
+    }`;
+
+    function createShader(type, src) {
+        const s = gl.createShader(type);
+        gl.shaderSource(s, src);
+        gl.compileShader(s);
+        if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+            console.error(gl.getShaderInfoLog(s));
+        return s;
+    }
+
+    // For now, just show a simple point cloud renderer as a fallback
+    // A proper gaussian splat WebGL renderer is complex; let's use a simpler approach
+
+    // Simple point cloud vertex shader
+    const simpleVertSrc = `#version 300 es
+    precision highp float;
+    uniform mat4 projection, view;
+    uniform float pointSize;
+    in vec3 position;
+    in vec3 color;
+    in float opacity;
+    out vec3 vColor;
+    out float vOpacity;
+    void main() {
+        vec4 p = view * vec4(position, 1.0);
+        gl_Position = projection * p;
+        gl_PointSize = pointSize / max(p.z, 0.1);
+        vColor = color;
+        vOpacity = opacity;
+    }`;
+
+    const simpleFragSrc = `#version 300 es
+    precision highp float;
+    in vec3 vColor;
+    in float vOpacity;
+    out vec4 fragColor;
+    void main() {
+        vec2 c = gl_PointCoord * 2.0 - 1.0;
+        float r = dot(c, c);
+        if (r > 1.0) discard;
+        float alpha = vOpacity * exp(-r * 2.0);
+        fragColor = vec4(vColor * alpha, alpha);
+    }`;
+
+    const prog = gl.createProgram();
+    gl.attachShader(prog, createShader(gl.VERTEX_SHADER, simpleVertSrc));
+    gl.attachShader(prog, createShader(gl.FRAGMENT_SHADER, simpleFragSrc));
+    gl.linkProgram(prog);
+
+    const uProj = gl.getUniformLocation(prog, 'projection');
+    const uView = gl.getUniformLocation(prog, 'view');
+    const uPointSize = gl.getUniformLocation(prog, 'pointSize');
+    const aPos = gl.getAttribLocation(prog, 'position');
+    const aColor = gl.getAttribLocation(prog, 'color');
+    const aOpacity = gl.getAttribLocation(prog, 'opacity');
+
+    let numPoints = 0;
+    let posBuffer, colorBuffer, opacityBuffer;
+
+    // Parse PLY (binary little-endian, standard 3DGS format)
+    async function loadPLY(data) {
+        const text = new TextDecoder().decode(data.slice(0, 4096));
+        const headerEnd = text.indexOf('end_header\n') + 'end_header\n'.length;
+        const vertexMatch = text.match(/element vertex (\d+)/);
+        const numVerts = parseInt(vertexMatch[1]);
+
+        // Parse property list
+        const props = [];
+        const lines = text.slice(0, headerEnd).split('\n');
+        let inVertex = false;
+        for (const line of lines) {
+            if (line.startsWith('element vertex')) inVertex = true;
+            else if (line.startsWith('element')) inVertex = false;
+            else if (inVertex && line.startsWith('property float')) {
+                props.push(line.split(' ')[2]);
+            }
+        }
+
+        const stride = props.length * 4; // all floats
+        const binaryData = new DataView(data.buffer, data.byteOffset + headerEnd);
+
+        const positions = new Float32Array(numVerts * 3);
+        const colors = new Float32Array(numVerts * 3);
+        const opacities = new Float32Array(numVerts);
+
+        const propIdx = {};
+        props.forEach((p, i) => propIdx[p] = i);
+
+        for (let i = 0; i < numVerts; i++) {
+            const offset = i * stride;
+            positions[i*3] = binaryData.getFloat32(offset + propIdx['x'] * 4, true);
+            positions[i*3+1] = binaryData.getFloat32(offset + propIdx['y'] * 4, true);
+            positions[i*3+2] = binaryData.getFloat32(offset + propIdx['z'] * 4, true);
+
+            // SH DC coefficients -> RGB (apply sigmoid-like mapping)
+            const dc0 = binaryData.getFloat32(offset + propIdx['f_dc_0'] * 4, true);
+            const dc1 = binaryData.getFloat32(offset + propIdx['f_dc_1'] * 4, true);
+            const dc2 = binaryData.getFloat32(offset + propIdx['f_dc_2'] * 4, true);
+            // Standard SH to color: C = 0.5 + SH_C0 * dc
+            const SH_C0 = 0.28209479177387814;
+            colors[i*3] = Math.max(0, Math.min(1, 0.5 + SH_C0 * dc0));
+            colors[i*3+1] = Math.max(0, Math.min(1, 0.5 + SH_C0 * dc1));
+            colors[i*3+2] = Math.max(0, Math.min(1, 0.5 + SH_C0 * dc2));
+
+            // Opacity: stored as logit, apply sigmoid
+            const logit = binaryData.getFloat32(offset + propIdx['opacity'] * 4, true);
+            opacities[i] = 1.0 / (1.0 + Math.exp(-logit));
+        }
+
+        return { positions, colors, opacities, numVerts };
+    }
+
+    async function loadModel(data) {
+        loading.classList.remove('hidden');
+        dropzone.classList.add('hidden');
+
+        const { positions, colors, opacities, numVerts } = await loadPLY(data);
+        numPoints = numVerts;
+
+        posBuffer = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, posBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, positions, gl.STATIC_DRAW);
+
+        colorBuffer = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, colorBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, colors, gl.STATIC_DRAW);
+
+        opacityBuffer = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, opacityBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, opacities, gl.STATIC_DRAW);
+
+        info.textContent = `${numVerts.toLocaleString()} splats`;
+        loading.classList.add('hidden');
+    }
+
+    // Matrix helpers
+    function perspective(fov, aspect, near, far) {
+        const f = 1 / Math.tan(fov / 2);
+        return new Float32Array([
+            f/aspect, 0, 0, 0,
+            0, f, 0, 0,
+            0, 0, (far+near)/(near-far), -1,
+            0, 0, 2*far*near/(near-far), 0
+        ]);
+    }
+
+    function lookAt() {
+        const cy = Math.cos(yaw), sy = Math.sin(yaw);
+        const cp = Math.cos(pitch), sp = Math.sin(pitch);
+        const ex = camX + camZ * sy * cp;
+        const ey = camY + camZ * sp;
+        const ez = camZ * cy * cp;
+
+        // Simple view matrix
+        const fx = -sy, fy = 0, fz = -cy; // forward (negated for view)
+        const ux = 0, uy = 1, uz = 0;
+        const rx = cy, ry = 0, rz = -sy;
+
+        // Proper orbit view matrix
+        const cosy = Math.cos(-yaw), siny = Math.sin(-yaw);
+        const cosp = Math.cos(-pitch), sinp = Math.sin(-pitch);
+
+        return new Float32Array([
+            cosy, sinp*siny, -cosp*siny, 0,
+            0, cosp, sinp, 0,
+            siny, -sinp*cosy, cosp*cosy, 0,
+            -camX*cosy - 0*0 - camZ*0, // simplified
+            -camX*sinp*siny - camY*cosp - camZ*0,
+            camX*cosp*siny - camY*sinp - camZ*cosp*cosy,
+            // Actually just use a simple orbit
+            0, 0, 0, 1
+        ]);
+    }
+
+    function orbitViewMatrix() {
+        const m = new Float32Array(16);
+        const cy = Math.cos(yaw), sy = Math.sin(yaw);
+        const cp = Math.cos(pitch), sp = Math.sin(pitch);
+
+        // Rotation
+        m[0] = cy;        m[4] = 0;   m[8] = sy;         m[12] = 0;
+        m[1] = sp*sy;     m[5] = cp;  m[9] = -sp*cy;     m[13] = 0;
+        m[2] = -cp*sy;    m[6] = sp;  m[10] = cp*cy;     m[14] = 0;
+        m[3] = 0;         m[7] = 0;   m[11] = 0;         m[15] = 1;
+
+        // Translate by -camZ along view direction, plus pan
+        m[12] = -(m[0]*camX + m[4]*camY + m[8]*0);
+        m[13] = -(m[1]*camX + m[5]*camY + m[9]*0);
+        m[14] = -(m[2]*camX + m[6]*camY + m[10]*camZ);
+
+        return m;
+    }
+
+    function render() {
+        requestAnimationFrame(render);
+        if (numPoints === 0) return;
+
+        gl.clearColor(0.1, 0.1, 0.1, 1);
+        gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+        gl.enable(gl.BLEND);
+        gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+        gl.enable(gl.PROGRAM_POINT_SIZE);
+
+        gl.useProgram(prog);
+
+        const aspect = canvas.width / canvas.height;
+        gl.uniformMatrix4fv(uProj, false, perspective(1.0, aspect, 0.1, 100));
+        gl.uniformMatrix4fv(uView, false, orbitViewMatrix());
+        gl.uniform1f(uPointSize, 300);
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, posBuffer);
+        gl.enableVertexAttribArray(aPos);
+        gl.vertexAttribPointer(aPos, 3, gl.FLOAT, false, 0, 0);
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, colorBuffer);
+        gl.enableVertexAttribArray(aColor);
+        gl.vertexAttribPointer(aColor, 3, gl.FLOAT, false, 0, 0);
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, opacityBuffer);
+        gl.enableVertexAttribArray(aOpacity);
+        gl.vertexAttribPointer(aOpacity, 1, gl.FLOAT, false, 0, 0);
+
+        gl.drawArrays(gl.POINTS, 0, numPoints);
+    }
+    requestAnimationFrame(render);
+
+    // File drop
+    document.addEventListener('dragover', e => e.preventDefault());
+    document.addEventListener('drop', async e => {
+        e.preventDefault();
+        const file = e.dataTransfer.files[0];
+        if (file) {
+            const data = new Uint8Array(await file.arrayBuffer());
+            await loadModel(data);
+        }
+    });
+
+    // URL parameter or auto-load
+    const params = new URLSearchParams(location.search);
+    const fileUrl = params.get('url') || params.get('file');
+    if (fileUrl) {
+        fetch(fileUrl)
+            .then(r => r.arrayBuffer())
+            .then(d => loadModel(new Uint8Array(d)))
+            .catch(e => { info.textContent = 'Error: ' + e.message; });
+    }
+    </script>
+</body>
+</html>
