@@ -153,10 +153,9 @@ def test_look_at():
     det = torch.det(R)
     assert abs(det.item() - 1.0) < 1e-5, f"det(R) != 1: {det.item()}"
 
-    # Camera at [0,0,3] looking at origin: origin should map to [0,0,-3] in camera space
+    # Camera at [0,0,3] looking at origin: origin should map to Z>0 in camera space (gsplat convention)
     origin_cam = (R @ torch.tensor([0.0, 0.0, 0.0]) + T[:3, 3])
-    # Z component should be negative (in front of camera looking down -Z)
-    assert origin_cam[2] < 0, f"Origin not in front of camera: {origin_cam}"
+    assert origin_cam[2] > 0, f"Origin not in front of camera (need Z>0): {origin_cam}"
 
     print("PASS: look_at produces valid camera matrix")
 

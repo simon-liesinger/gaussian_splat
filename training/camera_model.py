@@ -123,8 +123,12 @@ def look_at(eye: torch.Tensor, target: torch.Tensor, up: torch.Tensor) -> torch.
 
     up = torch.linalg.cross(right, forward)
 
-    # Camera convention: X=right, Y=up, Z=-forward (looking down -Z)
-    R = torch.stack([right, up, -forward], dim=0)  # [3, 3]
+    # gsplat convention: objects in front have positive Z in camera space.
+    # X = right, Y = -up (image Y points down), Z = forward (toward scene).
+    # But forward here points from eye to target = -eye_dir, so objects
+    # beyond target need Z flipped. The correct matrix that puts the target
+    # at positive Z is: row0=right, row1=-up, row2=forward.
+    R = torch.stack([right, -up, forward], dim=0)  # [3, 3]
     t = R @ (-eye)  # [3]
 
     T = torch.eye(4, device=eye.device, dtype=eye.dtype)
