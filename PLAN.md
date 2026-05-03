@@ -2,15 +2,17 @@
 
 ## Context
 
-We want a Mac app that takes a video (or series of images) and constructs a 3D Gaussian Splat model. The key novelty: **no COLMAP/SfM/pointcloud step**. Instead, we start with randomized splats and camera positions, then jointly optimize everything via gradient descent. Camera gradients are obtained by the "move splats the opposite direction" trick — transforming splats into camera space before rasterizing, so the existing position gradients give camera gradients for free.
+We want a Mac app that takes a video (or series of images) and constructs a 3D Gaussian Splat model. The deliberate constraint: **no COLMAP, no SfM, no learned pose prior, no depth network**. We start from random splats and (almost-)random cameras and let joint photometric gradient descent figure everything out.
 
-## Key Research Finding
+This is unproven. Every "COLMAP-free" paper we know of (3R-GS, TrackGS, GloSplat) actually uses a strong prior — MASt3R-SfM, learned 3D tracks, or global feature-based SfM — and only refines poses jointly with appearance. We're going further: true cold start. It might not work on real handheld video. **That's the experiment.** The plan below tries to give cold start the best possible chance and to fail informatively when it doesn't.
 
-**gsplat** (nerfstudio-project/gsplat) already separates camera transforms from rasterization exactly the way we want:
-- `pos_cam = R @ pos_world + t` happens outside the rasterizer
-- Backward pass gives `dL/d(pos_cam)` per splat
-- `dL/dt = sum(dL/d(pos_cam))` and `dL/dR` chains through position + covariance transforms
-- No rasterizer modification needed — we wrap the existing one
+## How Camera Gradients Work
+
+**gsplat already supports differentiable camera poses natively.** `gsplat.rasterization(...)` accepts `viewmats` as a `[C, 4, 4]` tensor; PyTorch autograd flows through it. Setting `viewmats.requires_grad_(True)` is sufficient — no rasterizer modification, no wrapper. Intrinsics `Ks` are not differentiable, so we keep them fixed.
+
+An earlier version of this plan proposed a "transform splats into camera space, rasterize with identity" wrapper to extract camera gradients via splat position gradients. That wrapper is mathematically equivalent to what gsplat does internally and is therefore redundant. The current code in `training/camera_model.py` still implements it; we will replace it with direct `viewmats` optimization.
+
+**Pose parameterization.** Storing a raw quaternion + translation and renormalizing each step is brittle for cold-start optimization where poses move large distances. We will parameterize each camera as `(R0, t0)` (a fixed reference pose) plus a learnable `se(3)` tangent vector `ξ ∈ R^6`, applied via the matrix exponential. This gives a well-conditioned local update without unit-norm drift, and lets us re-anchor `(R0, t0)` periodically if `ξ` grows large.
 
 Other useful repos:
 - **splat-apple** (ghif/splat-apple) — MLX/Metal training, full backward pass, ~150 lines of pure-array rasterizer
@@ -29,10 +31,13 @@ Other useful repos:
 | H100 | ~8 min | ~$0.36 |
 | FastGS (CVPR 2026) | 77–100 sec | ~$0.007 |
 
-COLMAP-free joint camera optimization adds **negligible overhead** (0–5% extra time per papers: GloSplat, 3R-GS, TrackGS).
+**Caveat on the 0–5% overhead claim.** That number from GloSplat/3R-GS/TrackGS measures *per-iteration* pose-refinement cost on top of a strong prior. It does **not** measure end-to-end cold-start cost. Cold start may need many more iterations, may converge slowly, or may fail to converge for non-object-centric captures. Treat 30k iterations as a starting point, not a budget.
 
-### Apple Silicon estimates
-No published benchmarks for splat-apple iteration speed. General expectation: **10–50x slower** than CUDA GPUs for ML training workloads. Rough estimate: ~2–10 hours on M3 Max for 30k iterations. Needs benchmarking.
+### Apple Silicon estimates — BENCHMARK FIRST
+
+No published benchmarks for gsplat-on-MPS or splat-apple iteration speed. Rough expectation is 10–50× slower than CUDA, putting 30k iterations somewhere in the 2–10 hour range on an M3 Max — but this is a guess with a 5× spread.
+
+**This needs to be the first thing we measure.** It determines whether the inner dev loop is local (great) or RunPod-only (acceptable but slower iteration). Concrete benchmark target: time per iteration at 100k splats × {200², 400², 800²} resolution, with both `mps` and `cpu` backends, on the available Apple Silicon hardware. See M0 below.
 
 ### Memory
 - ~24 GB VRAM for standard training (up to ~5M gaussians)
@@ -97,106 +102,150 @@ gaussian_splat/
     └── test_densification.py
 ```
 
-### Step 2: Camera model with "move splats opposite" approach
+### Step 2: Camera model — direct viewmat optimization in SE(3)
 
-`camera_model.py` — each camera stores a quaternion (4) + translation (3):
+`camera_model.py` — each camera stores a fixed reference pose `(R0, t0)` plus a learnable `se(3)` tangent vector `ξ ∈ R^6` = `(ω, v)` (rotation + translation parts of the Lie algebra).
 
 ```python
-def transform_to_camera(means3D, quats_world, scales, camera_q, camera_t):
-    """Transform all splats into camera space.
-    
-    This is the key trick: instead of differentiating the rasterizer
-    w.r.t. camera params, we move all splats by the inverse camera
-    transform. The rasterizer's existing position gradients then
-    give us camera gradients for free:
-      dL/d(camera_t) = -sum(dL/d(pos_cam))
-      dL/d(camera_R) chains through pos_cam and cov_cam
-    """
-    R = quaternion_to_matrix(camera_q)        # [3,3]
-    means_cam = (means3D @ R.T) + camera_t    # [N, 3]
-    # Also rotate covariances: cov_cam = R @ cov_world @ R^T
-    # Also rotate splat quaternions into camera frame
-    return means_cam, rotated_quats, scales
+class CameraSet(nn.Module):
+    def __init__(self, num_cameras: int, init_poses: Tensor):
+        # init_poses: [N, 4, 4] world-to-camera matrices from initialization
+        self.register_buffer("R0", init_poses[:, :3, :3])  # [N, 3, 3]
+        self.register_buffer("t0", init_poses[:, :3, 3])   # [N, 3]
+        self.xi = nn.Parameter(torch.zeros(num_cameras, 6))  # se(3) tangent
+
+    def viewmats(self) -> Tensor:
+        """Return [N, 4, 4] world-to-camera matrices, differentiable in self.xi."""
+        delta = se3_exp(self.xi)              # [N, 4, 4]
+        base = pose_to_matrix(self.R0, self.t0)  # [N, 4, 4]
+        return delta @ base                   # left-multiply: refine in camera frame
+
+    def reanchor(self):
+        """Fold xi into (R0, t0) and reset xi to zero. Call when ||xi|| grows."""
+        with torch.no_grad():
+            new = self.viewmats()
+            self.R0.copy_(new[:, :3, :3])
+            self.t0.copy_(new[:, :3, 3])
+            self.xi.zero_()
 ```
 
-Camera params are `torch.nn.Parameter` with `requires_grad=True`. Gradients flow automatically through `transform_to_camera` into `camera_q` and `camera_t`.
+Then in the training loop we just hand `cameras.viewmats()` to gsplat:
+
+```python
+out = gsplat.rasterization(
+    means=gaussians.means, quats=gaussians.quats,
+    scales=gaussians.scales, opacities=gaussians.opacities,
+    colors=gaussians.colors,
+    viewmats=cameras.viewmats(),         # autograd flows here
+    Ks=intrinsics, width=W, height=H,
+)
+```
+
+No splat transform wrapper. Gradients to `cameras.xi` come for free via gsplat's existing `viewmats` differentiability. This is the **replacement** for the current `training/camera_model.py`, which still uses the wrapper approach and needs to be rewritten.
 
 ### Step 3: Training loop with joint optimization
 
 `train.py`:
 
 ```python
-for iteration in range(30_000):
-    # 1. Pick random training view
-    idx = random.randint(0, num_cameras - 1)
-    
-    # 2. Transform splats into this camera's frame
-    means_cam, quats_cam, scales = transform_to_camera(
-        gaussians.means, gaussians.quats, gaussians.scales,
-        cameras[idx].q, cameras[idx].t
+for iteration in range(num_iters):
+    # 1. Pick a batch of training views
+    idxs = sample_view_batch(...)
+
+    # 2. Render — gradients flow into gaussians AND cameras.xi
+    rendered, _, _ = gsplat.rasterization(
+        means=gaussians.means, quats=gaussians.quats,
+        scales=gaussians.scales, opacities=gaussians.opacities,
+        colors=gaussians.colors,
+        viewmats=cameras.viewmats()[idxs],
+        Ks=intrinsics[idxs], width=W, height=H,
     )
-    
-    # 3. Rasterize with identity camera (gsplat)
-    rendered = rasterize(means_cam, quats_cam, scales, 
-                         gaussians.opacities, gaussians.sh_coeffs,
-                         identity_viewmat, intrinsics)
-    
-    # 4. Loss
-    loss = (1 - λ) * l1_loss(rendered, target[idx]) + λ * (1 - ssim(rendered, target[idx]))
-    
-    # 5. Backward — gradients flow to both gaussian params AND camera params
+
+    # 3. Loss
+    loss = (1 - λ) * l1(rendered, target[idxs]) \
+         + λ * (1 - ssim(rendered, target[idxs]))
+
+    # 4. Backward
     loss.backward()
-    
-    # 6. Update
-    gaussian_optimizer.step()    # Adam, per-param LR
-    camera_optimizer.step()      # Adam, lower LR
-    
-    # 7. Densification (every 100 iters, after iter 500, before iter 15000)
-    if 500 <= iteration < 15000 and iteration % 100 == 0:
+    gaussian_optimizer.step()
+    camera_optimizer.step()
+
+    # 5. Periodically re-anchor camera Lie-algebra tangents to keep them small
+    if iteration % 500 == 0:
+        cameras.reanchor()
+
+    # 6. Densification — see Step 4. Disabled until pose stabilizes.
+    if densification_active(iteration, pose_change_rate):
         densify(gaussians, grad_accum)
 ```
 
-**Optimizer LRs:**
-- Splat positions: 1.6e-4 → 1.6e-6 (exponential decay)
+**Optimizer LRs (starting points; will need tuning under cold start):**
+- Splat positions: 1.6e-4 → 1.6e-6 (exponential decay, cosine over training)
 - Splat scales: 5e-3
 - Splat rotations: 1e-3
 - Splat opacity: 5e-2
-- Splat SH: 2.5e-3
-- Camera quaternion: 1e-4
-- Camera translation: 1e-3
+- Splat colors / SH: 2.5e-3
+- Camera `ξ` rotation part: 1e-3 during warm-up, decay to 1e-5
+- Camera `ξ` translation part: 1e-2 during warm-up, decay to 1e-4
+
+Cold start needs **higher** camera LRs early (poses move large distances) and aggressive decay later (avoid jitter once roughly converged). This is the opposite of the standard 3DGS pose-refinement schedule, which assumes COLMAP poses are nearly correct.
 
 ### Step 4: Densification (clone / split / prune)
 
-`densification.py` — runs every 100 iterations from iter 500 to 15000:
+The standard 3DGS schedule (start at iter 500, end at 15000, opacity reset every 3000) assumes COLMAP-initialized splats already sitting near the right geometry. Under cold start, the early splats are random and the early poses are wrong, so `||dL/d(mean)||` is dominated by pose error rather than missing geometry. Densifying on that signal will amplify garbage.
 
-1. **Track gradients**: accumulate `||dL/d(mean)||` per splat over 100 iterations
-2. **Clone**: splats with large avg gradient AND small scale → duplicate as-is
-3. **Split**: splats with large avg gradient AND large scale → replace with 2 half-scale splats offset along principal axis
-4. **Prune**: remove splats with opacity < 0.005, or scale > 10% of scene extent
-5. **Opacity reset**: every 3000 iterations, reset all opacities to 0.01 (prevents floaters)
-6. **Reset optimizer state** for new/modified splats
+`densification.py` — gated on pose stability:
+
+1. **Pose stability gate**: track running mean of `||Δξ||` per camera over the last N iterations. Only enable densification once the mean drops below a threshold (geometry has stopped chasing poses). For cold start this is likely 5–10k iterations in, not 500.
+2. **Track gradients**: accumulate `||dL/d(mean)||` per splat over 100 iterations once active.
+3. **Clone**: splats with large avg gradient AND small scale → duplicate as-is.
+4. **Split**: splats with large avg gradient AND large scale → replace with 2 half-scale splats offset along principal axis.
+5. **Prune**: remove splats with opacity < 0.005, or scale > 10% of scene extent.
+6. **Opacity reset**: only after densification has been running for several thousand iterations; not during pose convergence (would erase whatever geometry the poses have started to lock onto).
+7. **Reset optimizer state** for new/modified splats.
+
+Schedule is intentionally adaptive rather than hardcoded. We will instrument and tune.
 
 ### Step 5: Input pipeline
 
 `utils.py`:
 - **Video**: extract frames with OpenCV or ffmpeg, subsample to ~100-300 frames
 - **Images**: load from directory
-- Resize to training resolution (start 400×400, optionally progressive upscale)
-- Estimate intrinsics: `fx = fy = max(W, H)`, `cx = W/2`, `cy = H/2`
+- Resize to training resolution (start 200×200, progressive upscale to 400², 800², full)
+- **Intrinsics**: read EXIF focal length and sensor size when available; convert to pixel focal length. Fall back to `fx = fy = 1.2 × max(W, H)` (rough phone-camera prior) only if EXIF is missing. Keep intrinsics **fixed** through training — adding focal-length optimization to cold-start pose+geometry adds a third source of ambiguity we don't want to fight initially.
 
-### Step 6: Initialization strategy (no COLMAP)
+### Step 6: Initialization strategy (no COLMAP, no learned prior)
 
-Since we have no prior camera poses:
-1. **Gaussians**: random positions in [-1, 1]³, random colors, small uniform scale, full opacity. Start with ~10,000.
-2. **Cameras**: distribute on a hemisphere of radius 3, looking at origin, with small random perturbations. For video input, arrange sequentially along a smooth arc.
-3. **Warm-up phase** (iters 0–2000): higher camera LR, coarse resolution (200×200), fewer gaussians. Goal: find approximate camera arrangement.
-4. **Joint phase** (iters 2000–30000): normal LRs, full resolution, densification active.
+This is the hardest part. We have no priors. The plan:
+
+1. **Gaussians**: random positions in a ball of radius 1, random colors uniform in [0,1], small isotropic scale (~0.02), opacity 0.1. Start with **~100k splats**, not 10k — under cold start we need enough degrees of freedom that some random splats happen to land near the true geometry. Ten thousand is too few to cover a real scene without depth priors; the optimizer can't densify into structure that no splat is near.
+
+2. **Cameras**: the right init depends on the capture pattern, which we won't know automatically. Strategies to support and pick between:
+   - **Object-centric orbit** (e.g. walking around a statue): hemisphere init at radius 3 looking at origin, sequential along the path (each frame near the previous one's pose).
+   - **Forward-facing pan**: cameras roughly co-located, looking outward in slowly-rotating directions.
+   - **Translational sweep**: cameras along a line, parallel orientations.
+   - **Default for the LocalSend test videos**: assume sequential capture, init each camera near the previous one with small random perturbation. Initial absolute placement: hemisphere arc.
+
+3. **Coarse-to-fine schedule** (rough plan, to be tuned by experiment):
+   - **Stage A (pose-dominant warm-up)** — iters 0 to ~3k: 200×200 resolution, ~50k splats, high camera LR, gaussian LRs reduced 10×, no densification. Goal: poses reach a coarse-correct arrangement. Loss should drop sharply if cold start is going to work at all.
+   - **Stage B (joint refinement)** — iters 3k to ~15k: 400×400, full splat count, full LRs, gradual camera LR decay. Densification gated on pose stability.
+   - **Stage C (detail)** — iters 15k onward: 800×800 or full resolution, low camera LR, densification active, opacity resets.
+
+4. **Run multiple inits in parallel** (when possible). Cold start is non-convex; the cheapest way to deal with that is to run 4–8 different random seeds and keep the best one. Each costs $0.06 on a 4090.
+
+5. **Failure modes to instrument**:
+   - All cameras collapse to the same pose (degenerate solution where every view looks identical).
+   - Splats collapse to a single point.
+   - Loss plateaus high with poses still moving (under-parameterized).
+   - Loss drops fast then explodes when densification kicks in (premature densification on bad geometry).
+
+   Log per-camera `||ξ||` over time, per-splat opacity histogram, rendered-vs-target deltas. We need to *see* failures to fix them.
 
 ### Step 7: Export and verification
 
-- Export trained gaussians to .ply (standard format)
-- Export recovered camera poses
-- Test with a known synthetic scene (e.g., render a cube from known cameras, verify recovery)
+- **.ply schema**: write the GraphDECO 3DGS convention so MetalSplatter and other viewers can read it. Fields: `x y z nx ny nz f_dc_0 f_dc_1 f_dc_2 f_rest_0..f_rest_44 opacity scale_0 scale_1 scale_2 rot_0 rot_1 rot_2 rot_3`. Conventions: opacity stored in **logit space** (apply `sigmoid` at render), scales stored in **log space** (apply `exp` at render), rotation as quaternion in **wxyz** order, normals can be zeroed if not used. Add a round-trip test that exports a small splat set and re-renders it through MetalSplatter (or a Python .ply reader) before building the full Mac viewer.
+- Export recovered camera poses (JSON: per-camera `{quat: [w,x,y,z], trans: [x,y,z], fx, fy, cx, cy, width, height}`).
+- Test with a known synthetic scene (see verification section).
 
 ### Step 8: Mac viewer app
 
@@ -243,9 +292,16 @@ GET  /result/{id}    — download .ply when done
 
 ## Verification
 
-1. **Camera gradient test**: create a synthetic scene with known camera poses. Perturb cameras slightly. Verify that `loss.backward()` produces gradients that move cameras back toward ground truth. Compare autodiff gradients with finite-difference numerical gradients.
-2. **Convergence test on synthetic data**: render a simple scene (colored cubes) from known cameras. Start from random cameras + random splats. Verify both cameras and splats converge.
-3. **Real video test**: take a short video of an object, run training, inspect .ply output in a viewer.
+In strict order:
+
+1. **Camera gradient correctness** (M1): synthetic scene with known splats and known camera poses. Perturb a camera by a small `ξ`, render, compute loss against the ground-truth render. Confirm that:
+   - `loss.backward()` populates `cameras.xi.grad`
+   - finite-difference gradient (`(L(ξ+ε) - L(ξ-ε)) / 2ε`) matches autodiff to ~3 decimal places
+   - a single Adam step from a perturbed pose moves loss downward
+2. **Easy cold start — synthetic** (M2): textured cube scene. Initialize splats randomly and cameras at slightly-wrong poses (small noise). Verify both converge. Then increase pose noise progressively to find the cold-start radius of convergence.
+3. **Hard cold start — synthetic** (M2): same scene, but cameras initialized fully randomly on the hemisphere. This is the canary for "does cold start work at all?"
+4. **Easy real video** (M3): pick the easiest LocalSend clip (`VID_20260503_125941184.mp4`, 24s) — likely object-centric orbit. Train and inspect.
+5. **Hard real video** (M4): the harder clips. Honest acceptance criterion: produces a viewable .ply where the recovered cameras roughly trace the actual capture path. Not "matches state-of-the-art reconstruction quality."
 
 ## Repo Structure (updated)
 
@@ -286,20 +342,25 @@ gaussian_splat/
 
 ## Milestones
 
-1. **M1: Training works on synthetic data** — camera gradient test passes, convergence on known scene
-2. **M2: Training works on real video** — run on test videos, produce viewable .ply
-3. **M3: RunPod deployment** — Dockerized, API endpoint, can submit jobs remotely
-4. **M4: Mac viewer** — open .ply, orbit camera, show recovered cameras
-5. **M5: Android app** — capture video, upload, view result
+- **M0: Apple Silicon benchmark** — install gsplat, measure iter/sec at 100k splats × {200², 400², 800²} on this Mac. Decide: local-only, hybrid, or RunPod-only inner dev loop.
+- **M1: Camera gradient correctness** — verify gsplat's `viewmats` autograd matches finite-difference. Switch `camera_model.py` from the wrapper to direct `viewmats` + SE(3) tangent parameterization.
+- **M2: Cold start on synthetic data** — known textured scene, random init, verify both poses and splats converge. Map the radius of convergence.
+- **M3: Cold start on the easiest LocalSend video** — produces viewable .ply with cameras tracing the capture path.
+- **M4: Cold start on the harder LocalSend videos** — may require multi-seed runs, schedule changes, or just fail informatively.
+- **M5: RunPod deployment** — Dockerized API for offloading runs that are too slow locally or for parallel multi-seed sweeps.
+- **M6: Mac viewer** — .ply round-trip with MetalSplatter, orbit camera, recovered-cameras-as-frustums overlay.
+- **M7: Android app** — capture, upload, download .ply, render locally.
 
 ## Immediate Actions
 
-- [ ] Create GitHub repo `gaussian_splat`
-- [ ] Add `kim-em` as collaborator
-- [ ] Commit PLAN.md + initial project structure
-- [ ] Implement training core (steps 2–4)
-- [ ] Test with synthetic scene
-- [ ] Test with the 3 LocalSend videos
-- [ ] Deploy to RunPod
-- [ ] Build Mac viewer
-- [ ] Build Android app
+- [x] Create GitHub repo `gaussian_splat`
+- [x] Commit PLAN.md + initial project structure
+- [ ] **M0 — benchmark gsplat on Apple Silicon** (do this first, it gates everything else)
+- [ ] Replace `transform_to_camera` wrapper with direct `viewmats` + SE(3) tangent parameterization in `training/camera_model.py`
+- [ ] Implement camera gradient correctness test (M1)
+- [ ] Build synthetic cube scene + cold-start convergence test (M2)
+- [ ] Cold start on the easiest LocalSend video (M3)
+- [ ] Cold start on the harder LocalSend videos (M4)
+- [ ] Deploy to RunPod (M5)
+- [ ] Build Mac viewer (M6)
+- [ ] Build Android app (M7)
