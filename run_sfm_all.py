@@ -7,6 +7,7 @@ Extracts frames from videos, runs pycolmap SfM, saves sfm_result.json + frames.
 import os
 import sys
 import json
+import shutil
 import cv2
 import numpy as np
 from pathlib import Path
@@ -70,7 +71,7 @@ def extract_video_frames(video_path, output_dir, max_frames=300, sfm_subset=50):
     for i in range(0, len(all_files), sfm_step):
         src = all_files[i]
         dst = os.path.join(sfm_dir, src.name)
-        os.symlink(str(src), dst)
+        shutil.copy2(str(src), dst)
         sfm_count += 1
     print(f"  SfM subset: {sfm_count} frames in {sfm_dir}")
 
@@ -86,7 +87,7 @@ def prepare_image_dir(image_dir, output_dir):
         if f.name.startswith("._"):
             continue
         dst = os.path.join(all_dir, f.name)
-        os.symlink(str(f), dst)
+        shutil.copy2(str(f), dst)
         count += 1
     print(f"  Linked {count} images to {all_dir}")
     # Use all images for SfM
