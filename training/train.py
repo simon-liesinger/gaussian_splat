@@ -188,39 +188,27 @@ def train(args):
         input_names = sorted(os.listdir(args.input if os.path.isdir(args.input) else os.path.dirname(args.input)))
         input_names = [n for n in input_names if n.lower().endswith(('.jpg', '.jpeg', '.png')) and not n.startswith('._')]
 
-        # Build initial poses: use SfM where available, interpolate/default for rest
+        # Only use frames that have SfM poses — drop unregistered frames
         sfm_name_to_pose = {name: cam for name, cam in zip(sfm_names, sfm_cams)}
 
+        matched_indices = []
         init_poses = []
-        sfm_count = 0
-
-        # Build ordered list of known SfM indices for interpolation
-        sfm_indices = []
-        sfm_poses = []
         for idx, name in enumerate(input_names[:num_cameras]):
             if name in sfm_name_to_pose:
-                sfm_indices.append(idx)
-                sfm_poses.append(sfm_name_to_pose[name])
-
-        for idx, name in enumerate(input_names[:num_cameras]):
-            if name in sfm_name_to_pose:
+                matched_indices.append(idx)
                 init_poses.append(sfm_name_to_pose[name])
-                sfm_count += 1
-            elif sfm_indices:
-                # Interpolate: find nearest known SfM camera by frame index
-                dists = [abs(idx - si) for si in sfm_indices]
-                nearest = np.argmin(dists)
-                pose = sfm_poses[nearest].copy()
-                # Small perturbation proportional to frame distance
-                frame_dist = dists[nearest] / max(len(input_names), 1)
-                pose[:3, 3] += np.random.randn(3) * 0.05 * frame_dist
-                init_poses.append(pose)
-            else:
-                init_poses.append(np.eye(4, dtype=np.float32))
 
-        init_poses = torch.tensor(np.array(init_poses), dtype=torch.float32)
-        cameras = CameraSet(init_poses, device=device)
-        print(f"Initialized {sfm_count}/{num_cameras} cameras from SfM, rest interpolated")
+        if matched_indices:
+            frames_full = [frames_full[i] for i in matched_indices]
+            num_cameras = len(frames_full)
+            init_poses = torch.tensor(np.array(init_poses), dtype=torch.float32)
+            cameras = CameraSet(init_poses, device=device)
+            print(f"Using {num_cameras} SfM-registered frames (dropped {len(input_names) - num_cameras} unregistered)")
+        else:
+            cameras = CameraSet.init_sequential_arc(
+                num_cameras=num_cameras, radius=3.0, arc_degrees=120.0, device=device,
+            )
+            print(f"No SfM matches, using sequential arc")
     else:
         cameras = CameraSet.init_sequential_arc(
             num_cameras=num_cameras,
