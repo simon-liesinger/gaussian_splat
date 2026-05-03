@@ -102,13 +102,25 @@ def train(args):
         stages.append(stage)
     print(f"Running stages: {', '.join(s['name'] for s in stages)}")
 
+    # Save frames to disk for SfM (needed for video input)
+    import tempfile
+    if os.path.isfile(args.input):
+        sfm_image_dir = os.path.join(args.output, "frames")
+        os.makedirs(sfm_image_dir, exist_ok=True)
+        import cv2
+        for i, frame in enumerate(frames_full):
+            cv2.imwrite(os.path.join(sfm_image_dir, f"frame_{i:04d}.jpg"),
+                        cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+        print(f"Saved {len(frames_full)} frames to {sfm_image_dir}")
+    else:
+        sfm_image_dir = args.input
+
     # Run SfM to get camera poses and sparse point cloud
     sfm_result = None
     if not args.no_sfm:
         try:
             from sfm import run_sfm
-            input_dir = args.input if os.path.isdir(args.input) else os.path.dirname(args.input)
-            sfm_result = run_sfm(input_dir, device=device)
+            sfm_result = run_sfm(sfm_image_dir, device=device)
         except Exception as e:
             print(f"SfM failed ({e}), falling back to random cameras")
 
