@@ -9,3 +9,4 @@ output/
 .swiftpm/
 mac-viewer/.build/
 mac-viewer/_model.ply
+model.splat
