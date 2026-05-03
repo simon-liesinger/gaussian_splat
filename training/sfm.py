@@ -60,8 +60,11 @@ def run_sfm(image_dir: str, device: torch.device = torch.device("cuda")) -> dict
     intrinsics_out = []
     image_names = []
 
-    # Sort by image name for consistent ordering
+    # Sort by image name for consistent ordering with the input directory
     sorted_images = sorted(rec.images.values(), key=lambda img: img.name)
+
+    # Build a mapping from filename to SfM data
+    # so the caller can match SfM results to their image list
 
     for image in sorted_images:
         # World-to-camera transform

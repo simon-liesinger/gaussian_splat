@@ -157,11 +157,35 @@ def train(args):
             )
 
     # Initialize cameras
-    if sfm_result and len(sfm_result["cameras"]) == num_cameras:
-        # Use SfM camera poses
-        init_poses = torch.tensor(np.array(sfm_result["cameras"]), dtype=torch.float32)
+    if sfm_result and len(sfm_result["cameras"]) > 0:
+        sfm_names = sfm_result["image_names"]
+        sfm_cams = sfm_result["cameras"]
+
+        # Map input image filenames to SfM results
+        input_names = sorted(os.listdir(args.input if os.path.isdir(args.input) else os.path.dirname(args.input)))
+        input_names = [n for n in input_names if n.lower().endswith(('.jpg', '.jpeg', '.png')) and not n.startswith('._')]
+
+        # Build initial poses: use SfM where available, interpolate/default for rest
+        sfm_name_to_pose = {name: cam for name, cam in zip(sfm_names, sfm_cams)}
+
+        init_poses = []
+        sfm_count = 0
+        # Fallback: use mean of SfM cameras for unmatched images
+        mean_sfm_pose = np.mean(sfm_cams, axis=0) if sfm_cams else np.eye(4)
+
+        for name in input_names[:num_cameras]:
+            if name in sfm_name_to_pose:
+                init_poses.append(sfm_name_to_pose[name])
+                sfm_count += 1
+            else:
+                # Use mean SfM pose with small random perturbation
+                pose = mean_sfm_pose.copy()
+                pose[:3, 3] += np.random.randn(3) * 0.1
+                init_poses.append(pose)
+
+        init_poses = torch.tensor(np.array(init_poses), dtype=torch.float32)
         cameras = CameraSet(init_poses, device=device)
-        print(f"Initialized cameras from SfM poses")
+        print(f"Initialized {sfm_count}/{num_cameras} cameras from SfM, rest interpolated")
     else:
         cameras = CameraSet.init_sequential_arc(
             num_cameras=num_cameras,
