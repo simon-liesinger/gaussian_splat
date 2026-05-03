@@ -39,8 +39,15 @@ def run_sfm(image_dir: str, device: torch.device = torch.device("cuda")) -> dict
     pycolmap.extract_features(db_path, image_dir)
 
     # Feature matching
-    print("  Matching features...")
-    pycolmap.match_exhaustive(db_path)
+    # Use sequential matching for video (much faster than exhaustive)
+    # Falls back to exhaustive for small image sets
+    num_images = len(os.listdir(image_dir))
+    if num_images > 50:
+        print(f"  Matching features (sequential, {num_images} images)...")
+        pycolmap.match_sequential(db_path)
+    else:
+        print(f"  Matching features (exhaustive, {num_images} images)...")
+        pycolmap.match_exhaustive(db_path)
 
     # Incremental SfM
     print("  Running incremental mapper...")
