@@ -65,8 +65,10 @@ def run_sfm(image_dir: str, device: torch.device = torch.device("cuda")) -> dict
 
     for image in sorted_images:
         # World-to-camera transform
-        R = image.cam_from_world.rotation.matrix()  # 3x3 numpy
-        t = image.cam_from_world.translation  # 3-vector
+        # pycolmap 4.x: cam_from_world() is a method returning Rigid3d
+        cam_from_world = image.cam_from_world()
+        R = np.array(cam_from_world.rotation.matrix())  # 3x3
+        t = np.array(cam_from_world.translation)  # 3-vector
 
         viewmat = np.eye(4, dtype=np.float32)
         viewmat[:3, :3] = R
