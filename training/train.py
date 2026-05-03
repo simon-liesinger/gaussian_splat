@@ -104,11 +104,18 @@ def train(args):
 
     # Initialize model
     print(f"Initializing {args.num_gaussians} gaussians and {num_cameras} cameras...")
-    model = GaussianModel(
-        num_gaussians=args.num_gaussians,
-        sh_degree=0,
-        device=device,
-    )
+    try:
+        model = GaussianModel.from_images(
+            frames_full, num_gaussians=args.num_gaussians, device=device,
+        )
+        print(f"Initialized splat colors from image k-means")
+    except Exception as e:
+        print(f"Color init failed ({e}), using random init")
+        model = GaussianModel(
+            num_gaussians=args.num_gaussians,
+            sh_degree=0,
+            device=device,
+        )
 
     cameras = CameraSet.init_sequential_arc(
         num_cameras=num_cameras,

@@ -60,6 +60,62 @@ class GaussianModel(nn.Module):
         # SH coefficients: random colors (degree 0 = DC component = base color)
         self.sh_coeffs.data[:, 0, :].uniform_(-0.5, 0.5)
 
+    @staticmethod
+    def from_images(
+        images: list,
+        num_gaussians: int = 50,
+        device: torch.device = torch.device("cuda"),
+    ) -> "GaussianModel":
+        """Initialize splats with colors sampled from images, sized by color frequency.
+
+        Uses k-means to find diverse colors, then sizes each splat proportional
+        to how rare its color is (rare colors get small splats, common colors get big ones).
+        """
+        import numpy as np
+
+        # Collect all pixels from all images (downsample for speed)
+        all_pixels = []
+        for img in images:
+            h, w = img.shape[:2]
+            small = img[::max(1, h//50), ::max(1, w//50)]  # ~50x50
+            all_pixels.append(small.reshape(-1, 3).astype(float))
+        all_pixels = np.concatenate(all_pixels)
+
+        # K-means to find diverse colors
+        from sklearn.cluster import KMeans
+        km = KMeans(n_clusters=num_gaussians, n_init=3, random_state=42)
+        km.fit(all_pixels)
+        centers = km.cluster_centers_ / 255.0  # [0, 1]
+        counts = np.bincount(km.labels_, minlength=num_gaussians)
+        fractions = counts / counts.sum()
+
+        # Scale proportional to frequency: common colors -> big splats, rare -> small
+        # Map fraction to log-scale: biggest = 3.0, smallest = 0.02
+        sorted_fracs = np.sort(fractions)[::-1]
+        log_max, log_min = np.log(3.0), np.log(0.02)
+
+        log_scales = np.zeros(num_gaussians)
+        for i in range(num_gaussians):
+            # Rank this cluster's fraction
+            rank = np.searchsorted(-sorted_fracs, -fractions[i])  # rank 0 = most common
+            t = rank / max(num_gaussians - 1, 1)
+            log_scales[i] = log_max + t * (log_min - log_max)
+
+        model = GaussianModel(num_gaussians, sh_degree=0, device=device)
+
+        # Set colors: inverse sigmoid since get_colors applies sigmoid
+        colors_tensor = torch.tensor(centers, dtype=torch.float32, device=device)
+        colors_clamped = colors_tensor.clamp(0.01, 0.99)
+        inv_sigmoid = torch.log(colors_clamped / (1 - colors_clamped))
+        model.sh_coeffs.data[:, 0, :] = inv_sigmoid
+
+        # Set scales
+        model.scales_raw.data = torch.tensor(
+            log_scales, dtype=torch.float32, device=device
+        ).unsqueeze(-1).expand(num_gaussians, 3).clone()
+
+        return model
+
     @property
     def num_gaussians(self) -> int:
         return self.means.shape[0]
