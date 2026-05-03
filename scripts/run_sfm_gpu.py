@@ -192,6 +192,8 @@ exec sleep infinity
         "dockerStartCmd": ["bash", "-lc", bootstrap],
         "env": {"USER_PUBLIC_KEY": pubkey},
         "ports": ["22/tcp"],
+        "countryCodes": ["US"],
+        "minDownloadMbps": 500,
     }
     result = api_request("POST", "/pods", args.api_key, body)
     pod_id = result["id"]
@@ -217,7 +219,7 @@ exec sleep infinity
     print("Uploading images...")
     ssh_opts = ["-i", ssh_key, "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null"]
     subprocess.run(["scp", "-P", str(ssh_port)] + ssh_opts + [tar_path, f"root@{ip}:/workspace/uploading.tar.gz"],
-                   capture_output=True, timeout=300)
+                   capture_output=True, timeout=600)
     subprocess.run(["ssh", "-p", str(ssh_port)] + ssh_opts + [f"root@{ip}",
                    "mv /workspace/uploading.tar.gz /workspace/images.tar.gz"],
                    capture_output=True, timeout=30)

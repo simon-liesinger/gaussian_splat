@@ -213,7 +213,7 @@ function render() {{
     // Draw points
     gl.useProgram(prog);
     gl.uniformMatrix4fv(uMvp, false, mvp);
-    gl.uniform1f(uPSize, 300);
+    gl.uniform1f(uPSize, 30);
     gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
     gl.enableVertexAttribArray(0);
     gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
@@ -223,7 +223,7 @@ function render() {{
     gl.drawArrays(gl.POINTS, 0, pts.length);
 
     // Draw camera positions (larger green dots)
-    gl.uniform1f(uPSize, 1500);
+    gl.uniform1f(uPSize, 60);
     gl.bindBuffer(gl.ARRAY_BUFFER, camPosBuf);
     gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
     gl.bindBuffer(gl.ARRAY_BUFFER, camColBuf);
