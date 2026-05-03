@@ -193,18 +193,30 @@ def train(args):
 
         init_poses = []
         sfm_count = 0
-        # Fallback: use mean of SfM cameras for unmatched images
-        mean_sfm_pose = np.mean(sfm_cams, axis=0) if sfm_cams else np.eye(4)
 
-        for name in input_names[:num_cameras]:
+        # Build ordered list of known SfM indices for interpolation
+        sfm_indices = []
+        sfm_poses = []
+        for idx, name in enumerate(input_names[:num_cameras]):
+            if name in sfm_name_to_pose:
+                sfm_indices.append(idx)
+                sfm_poses.append(sfm_name_to_pose[name])
+
+        for idx, name in enumerate(input_names[:num_cameras]):
             if name in sfm_name_to_pose:
                 init_poses.append(sfm_name_to_pose[name])
                 sfm_count += 1
-            else:
-                # Use mean SfM pose with small random perturbation
-                pose = mean_sfm_pose.copy()
-                pose[:3, 3] += np.random.randn(3) * 0.1
+            elif sfm_indices:
+                # Interpolate: find nearest known SfM camera by frame index
+                dists = [abs(idx - si) for si in sfm_indices]
+                nearest = np.argmin(dists)
+                pose = sfm_poses[nearest].copy()
+                # Small perturbation proportional to frame distance
+                frame_dist = dists[nearest] / max(len(input_names), 1)
+                pose[:3, 3] += np.random.randn(3) * 0.05 * frame_dist
                 init_poses.append(pose)
+            else:
+                init_poses.append(np.eye(4, dtype=np.float32))
 
         init_poses = torch.tensor(np.array(init_poses), dtype=torch.float32)
         cameras = CameraSet(init_poses, device=device)
