@@ -168,8 +168,9 @@ def train(args):
         densifier.reset_accumulators(model.num_gaussians, device)
 
         for local_iter in tqdm(range(stage_iters), desc=stage_name):
-            cam_idx = random.randint(0, num_cameras - 1)
-            target = target_images[cam_idx]
+            # Render multiple views per iteration for 3D consistency
+            n_views = min(args.views_per_iter, num_cameras)
+            cam_idxs = random.sample(range(num_cameras), n_views)
 
             g_opt.zero_grad()
             c_opt.zero_grad()
@@ -183,8 +184,8 @@ def train(args):
                 scales=params["scales"],
                 opacities=params["opacities"],
                 colors=model.get_colors(),
-                viewmats=viewmats[cam_idx:cam_idx+1],
-                Ks=Ks[cam_idx:cam_idx+1],
+                viewmats=viewmats[cam_idxs],
+                Ks=Ks[cam_idxs],
                 width=width,
                 height=height,
                 near_plane=0.01,
@@ -192,9 +193,14 @@ def train(args):
                 render_mode="RGB",
             )
 
-            rendered = renders[0]
+            loss = sum(
+                combined_loss(renders[i], target_images[cam_idxs[i]], lambda_ssim=args.lambda_ssim)
+                for i in range(n_views)
+            ) / n_views
 
-            loss = combined_loss(rendered, target, lambda_ssim=args.lambda_ssim)
+            # For snapshots, keep the first rendered view
+            rendered = renders[0]
+            cam_idx = cam_idxs[0]
 
             loss.backward()
 
@@ -245,7 +251,7 @@ def train(args):
 
             if local_iter % args.save_interval == 0 and global_iter > 0:
                 save_snapshot(
-                    rendered, target, global_iter, stage_name,
+                    rendered, target_images[cam_idx], global_iter, stage_name,
                     loss.item(), model.num_gaussians,
                     os.path.join(args.output, "snapshots"),
                 )
@@ -374,6 +380,7 @@ def main():
     parser.add_argument("--log-interval", type=int, default=100)
     parser.add_argument("--save-interval", type=int, default=500, help="Save snapshot every N iterations")
     parser.add_argument("--stages", default="A,B,C", help="Comma-separated stages to run: A (warmup), B (joint), C (detail)")
+    parser.add_argument("--views-per-iter", type=int, default=3, help="Number of views rendered per iteration for 3D consistency")
     args = parser.parse_args()
 
     if rasterization is None:
