@@ -9,6 +9,8 @@ Poses are parameterized as SE(3) tangent vectors for well-conditioned updates.
 Usage:
     python train.py --input video.mp4 --output output/
     python train.py --input images_dir/ --output output/
+    python train.py --input images_dir/ --output output/ --stages A   # warmup only
+    python train.py --input images_dir/ --output output/ --stages A,B # warmup + joint
 """
 
 import argparse
@@ -16,6 +18,7 @@ import os
 import random
 import time
 import json
+import math
 
 import torch
 import numpy as np
@@ -40,7 +43,6 @@ except ImportError:
 
 
 def make_gaussian_optimizer(model: GaussianModel, position_lr: float = 1.6e-4) -> torch.optim.Adam:
-    """Create optimizer for gaussian parameters."""
     return torch.optim.Adam([
         {"params": [model.means], "lr": position_lr, "name": "means"},
         {"params": [model.scales_raw], "lr": 5e-3, "name": "scales"},
@@ -51,23 +53,25 @@ def make_gaussian_optimizer(model: GaussianModel, position_lr: float = 1.6e-4) -
 
 
 def make_camera_optimizer(cameras: CameraSet, lr_rot: float = 1e-3, lr_trans: float = 1e-2) -> torch.optim.Adam:
-    """Create optimizer for camera poses (SE(3) tangent vectors)."""
     return torch.optim.Adam([
         {"params": [cameras.xi], "lr": lr_rot, "name": "camera_xi"},
     ], eps=1e-15)
 
 
-def cosine_decay(initial: float, final: float, step: int, total: int) -> float:
-    """Cosine annealing from initial to final."""
-    t = min(step / max(total, 1), 1.0)
-    return final + 0.5 * (initial - final) * (1 + math.cos(math.pi * t))
-
-
-import math
+ALL_STAGES = {
+    "A": {"name": "A_warmup", "res": 200, "iters": 3000,
+         "cam_lr_rot": 1e-3, "cam_lr_trans": 1e-2,
+         "gauss_lr_scale": 0.1, "densify": False},
+    "B": {"name": "B_joint", "res": 400, "iters": 12000,
+         "cam_lr_rot": 5e-4, "cam_lr_trans": 5e-3,
+         "gauss_lr_scale": 1.0, "densify": True},
+    "C": {"name": "C_detail", "res": None, "iters": 15000,
+         "cam_lr_rot": 1e-5, "cam_lr_trans": 1e-4,
+         "gauss_lr_scale": 1.0, "densify": True},
+}
 
 
 def train(args):
-    """Main training loop with coarse-to-fine schedule."""
     device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
     print(f"Using device: {device}")
 
@@ -86,18 +90,17 @@ def train(args):
     h_full, w_full = frames_full[0].shape[:2]
     print(f"Loaded {num_cameras} frames at {w_full}x{h_full}")
 
-    # Coarse-to-fine resolution schedule
-    stages = [
-        {"name": "A_warmup", "res": 200, "iters": 3000,
-         "cam_lr_rot": 1e-3, "cam_lr_trans": 1e-2,
-         "gauss_lr_scale": 0.1, "densify": False},
-        {"name": "B_joint", "res": 400, "iters": 12000,
-         "cam_lr_rot": 5e-4, "cam_lr_trans": 5e-3,
-         "gauss_lr_scale": 1.0, "densify": True},
-        {"name": "C_detail", "res": min(800, max(w_full, h_full)), "iters": 15000,
-         "cam_lr_rot": 1e-5, "cam_lr_trans": 1e-4,
-         "gauss_lr_scale": 1.0, "densify": True},
-    ]
+    # Select stages
+    stage_keys = [s.strip().upper() for s in args.stages.split(",")]
+    stages = []
+    for k in stage_keys:
+        if k not in ALL_STAGES:
+            raise ValueError(f"Unknown stage '{k}'. Valid: A, B, C")
+        stage = dict(ALL_STAGES[k])
+        if stage["res"] is None:
+            stage["res"] = min(800, max(w_full, h_full))
+        stages.append(stage)
+    print(f"Running stages: {', '.join(s['name'] for s in stages)}")
 
     # Initialize model
     print(f"Initializing {args.num_gaussians} gaussians and {num_cameras} cameras...")
@@ -107,7 +110,6 @@ def train(args):
         device=device,
     )
 
-    # Initialize cameras
     cameras = CameraSet.init_sequential_arc(
         num_cameras=num_cameras,
         radius=3.0,
@@ -115,7 +117,6 @@ def train(args):
         device=device,
     )
 
-    # Densification controller
     densifier = DensificationController(
         grad_threshold=args.densify_grad_threshold,
         scene_extent=3.0,
@@ -123,7 +124,6 @@ def train(args):
 
     os.makedirs(args.output, exist_ok=True)
 
-    # Training log
     log = {"stages": [], "iterations": []}
 
     global_iter = 0
@@ -137,7 +137,6 @@ def train(args):
         print(f"Stage {stage_name}: {res}x{res}, {stage_iters} iterations")
         print(f"{'='*60}")
 
-        # Resize frames for this stage
         import cv2
         target_images = []
         for f in frames_full:
@@ -148,7 +147,6 @@ def train(args):
         width, height = res, res
         fx, fy, cx, cy = estimate_intrinsics(width, height)
 
-        # Build intrinsics matrix [N, 3, 3] (same for all cameras)
         K = torch.tensor([
             [fx, 0, cx],
             [0, fy, cy],
@@ -156,7 +154,6 @@ def train(args):
         ], device=device, dtype=torch.float32)
         Ks = K.unsqueeze(0).expand(num_cameras, -1, -1)
 
-        # Create optimizers for this stage
         pos_lr = 1.6e-4 * stage["gauss_lr_scale"]
         g_opt = make_gaussian_optimizer(model, position_lr=pos_lr)
         c_opt = make_camera_optimizer(cameras, lr_rot=stage["cam_lr_rot"], lr_trans=stage["cam_lr_trans"])
@@ -164,17 +161,14 @@ def train(args):
         densifier.reset_accumulators(model.num_gaussians, device)
 
         for local_iter in tqdm(range(stage_iters), desc=stage_name):
-            # Sample random view
             cam_idx = random.randint(0, num_cameras - 1)
             target = target_images[cam_idx]
 
             g_opt.zero_grad()
             c_opt.zero_grad()
 
-            # Get viewmats (differentiable in cameras.xi)
-            viewmats = cameras.viewmats()  # [N, 4, 4]
+            viewmats = cameras.viewmats()
 
-            # Render via gsplat
             params = model.get_activated()
             renders, alphas, meta = rasterization(
                 means=params["means"],
@@ -182,8 +176,8 @@ def train(args):
                 scales=params["scales"],
                 opacities=params["opacities"],
                 colors=model.get_colors(),
-                viewmats=viewmats[cam_idx:cam_idx+1],  # [1, 4, 4]
-                Ks=Ks[cam_idx:cam_idx+1],               # [1, 3, 3]
+                viewmats=viewmats[cam_idx:cam_idx+1],
+                Ks=Ks[cam_idx:cam_idx+1],
                 width=width,
                 height=height,
                 near_plane=0.01,
@@ -191,28 +185,22 @@ def train(args):
                 render_mode="RGB",
             )
 
-            rendered = renders[0]  # [H, W, 3]
+            rendered = renders[0]
 
-            # Loss
             loss = combined_loss(rendered, target, lambda_ssim=args.lambda_ssim)
 
-            # Backward
             loss.backward()
 
-            # Track gradients for densification
             if stage["densify"] and model.means.grad is not None:
                 densifier.accumulate(model.means.grad)
 
-            # Step
             g_opt.step()
             c_opt.step()
 
-            # Re-anchor SE(3) tangents periodically
             if local_iter > 0 and local_iter % 500 == 0:
                 cameras.reanchor()
                 c_opt = make_camera_optimizer(cameras, lr_rot=stage["cam_lr_rot"], lr_trans=stage["cam_lr_trans"])
 
-            # Densification
             if (stage["densify"]
                     and local_iter >= 500
                     and local_iter % 100 == 0
@@ -226,12 +214,10 @@ def train(args):
                         f"= {stats['total']} total"
                     )
 
-            # Opacity reset (only in later stages)
             if stage_name == "C_detail" and local_iter > 0 and local_iter % 3000 == 0:
                 model.reset_opacities()
                 tqdm.write(f"[{global_iter}] Reset opacities")
 
-            # Logging
             if local_iter % args.log_interval == 0:
                 elapsed = time.time() - start_time
                 xi_norm = cameras.xi.data.norm(dim=-1).mean().item()
@@ -250,7 +236,6 @@ def train(args):
                         f"n={model.num_gaussians} xi={xi_norm:.4f}"
                     )
 
-            # Save snapshot (rendered vs target side-by-side)
             if local_iter % args.save_interval == 0 and global_iter > 0:
                 save_snapshot(
                     rendered, target, global_iter, stage_name,
@@ -287,7 +272,6 @@ def train(args):
     for i in range(num_cameras):
         R = viewmats[i, :3, :3]
         t = viewmats[i, :3, 3]
-        # Convert to quaternion for interop
         q = rotation_matrix_to_quaternion(R)
         cam_data.append({
             "quat": q.tolist(),
@@ -310,10 +294,9 @@ def train(args):
 
 def rotation_matrix_to_quaternion(R: torch.Tensor) -> torch.Tensor:
     """Convert [3,3] rotation matrix to [w,x,y,z] quaternion. Numerically robust."""
-    # Shepperd's method: pick the largest diagonal element for stability
     diag = torch.stack([R[0,0], R[1,1], R[2,2], R.trace()])
     idx = diag.argmax().item()
-    if idx == 3:  # trace is largest
+    if idx == 3:
         s = (1.0 + R.trace()).clamp(min=1e-8).sqrt() * 2
         w = 0.25 * s
         x = (R[2,1] - R[1,2]) / s
@@ -349,20 +332,17 @@ def save_snapshot(
     num_gaussians: int,
     output_dir: str,
 ):
-    """Save side-by-side rendered vs target snapshot with metadata."""
     import cv2
     os.makedirs(output_dir, exist_ok=True)
 
     r = (rendered.detach().cpu().clamp(0, 1) * 255).byte().numpy()
     t = (target.detach().cpu().clamp(0, 1) * 255).byte().numpy()
 
-    # Side by side
     h, w = r.shape[:2]
     canvas = np.zeros((h + 30, w * 2 + 4, 3), dtype=np.uint8)
     canvas[:h, :w] = r
     canvas[:h, w+4:] = t
 
-    # Add label bar at bottom
     label = f"iter {iteration} | {stage} | loss {loss_val:.4f} | {num_gaussians} splats"
     canvas_bgr = cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR)
     cv2.putText(canvas_bgr, label, (8, h + 20),
@@ -386,6 +366,7 @@ def main():
     parser.add_argument("--densify-grad-threshold", type=float, default=0.0002)
     parser.add_argument("--log-interval", type=int, default=100)
     parser.add_argument("--save-interval", type=int, default=500, help="Save snapshot every N iterations")
+    parser.add_argument("--stages", default="A,B,C", help="Comma-separated stages to run: A (warmup), B (joint), C (detail)")
     args = parser.parse_args()
 
     if rasterization is None:
