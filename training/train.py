@@ -102,22 +102,33 @@ def train(args):
         stages.append(stage)
     print(f"Running stages: {', '.join(s['name'] for s in stages)}")
 
-    # Save frames to disk for SfM (needed for video input)
-    import tempfile
-    if os.path.isfile(args.input):
-        sfm_image_dir = os.path.join(args.output, "frames")
-        os.makedirs(sfm_image_dir, exist_ok=True)
-        import cv2
-        for i, frame in enumerate(frames_full):
-            cv2.imwrite(os.path.join(sfm_image_dir, f"frame_{i:04d}.jpg"),
-                        cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
-        print(f"Saved {len(frames_full)} frames to {sfm_image_dir}")
-    else:
-        sfm_image_dir = args.input
-
-    # Run SfM to get camera poses and sparse point cloud
+    # Run SfM or load pre-computed result
     sfm_result = None
-    if not args.no_sfm:
+    if args.sfm_result:
+        # Load pre-computed SfM result
+        import json as json_mod
+        with open(args.sfm_result) as f:
+            sfm_data = json_mod.load(f)
+        sfm_result = {
+            "cameras": [np.array(c, dtype=np.float32) for c in sfm_data["cameras"]],
+            "intrinsics": [tuple(x) for x in sfm_data["intrinsics"]],
+            "image_names": sfm_data["image_names"],
+            "points3d": np.array(sfm_data["points3d"], dtype=np.float32),
+            "point_colors": np.array(sfm_data["point_colors"], dtype=np.uint8),
+        }
+        print(f"Loaded pre-computed SfM: {len(sfm_result['cameras'])} cameras, {len(sfm_result['points3d'])} points")
+    elif not args.no_sfm:
+        # Save frames to disk for SfM (needed for video input)
+        if os.path.isfile(args.input):
+            sfm_image_dir = os.path.join(args.output, "frames")
+            os.makedirs(sfm_image_dir, exist_ok=True)
+            import cv2
+            for i, frame in enumerate(frames_full):
+                cv2.imwrite(os.path.join(sfm_image_dir, f"frame_{i:04d}.jpg"),
+                            cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+            print(f"Saved {len(frames_full)} frames to {sfm_image_dir}")
+        else:
+            sfm_image_dir = args.input
         try:
             from sfm import run_sfm
             sfm_result = run_sfm(sfm_image_dir, device=device)
@@ -481,6 +492,7 @@ def main():
     parser.add_argument("--stages", default="A,B,C", help="Comma-separated stages to run: A (warmup), B (joint), C (detail)")
     parser.add_argument("--views-per-iter", type=int, default=3, help="Number of views rendered per iteration for 3D consistency")
     parser.add_argument("--no-sfm", action="store_true", help="Skip SfM, use random camera init")
+    parser.add_argument("--sfm-result", default=None, help="Path to pre-computed sfm_result.json")
     args = parser.parse_args()
 
     if rasterization is None:
