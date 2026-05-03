@@ -61,28 +61,30 @@ def test_transform_gradient_flows_to_camera():
 def test_camera_translation_gradient_numerical():
     """Compare autodiff translation gradient with finite differences."""
     torch.manual_seed(42)
-    eps = 1e-4
+    eps = 1e-7
+    dtype = torch.float64  # float64 needed for accurate finite differences
 
-    means = torch.randn(50, 3)
-    quats = F.normalize(torch.randn(50, 4), dim=-1)
-    scales = torch.rand(50, 3) * 0.1
-    cam_q = torch.tensor([1.0, 0.0, 0.0, 0.0])
+    means = torch.randn(50, 3, dtype=dtype)
+    quats = F.normalize(torch.randn(50, 4, dtype=dtype), dim=-1)
+    scales = torch.rand(50, 3, dtype=dtype) * 0.1
+    cam_q = torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=dtype)
 
     def compute_loss(t):
         means_cam, _, _ = transform_to_camera(means, quats, scales, cam_q, t)
         return (means_cam ** 2).sum()
 
-    cam_t = torch.tensor([0.0, 0.0, 3.0], requires_grad=True)
+    cam_t = torch.tensor([0.0, 0.0, 3.0], dtype=dtype, requires_grad=True)
     loss = compute_loss(cam_t)
     loss.backward()
     autodiff_grad = cam_t.grad.clone()
 
     # Finite differences
-    numerical_grad = torch.zeros(3)
+    t_base = cam_t.data.clone()
+    numerical_grad = torch.zeros(3, dtype=dtype)
     for i in range(3):
-        t_plus = cam_t.data.clone()
+        t_plus = t_base.clone()
         t_plus[i] += eps
-        t_minus = cam_t.data.clone()
+        t_minus = t_base.clone()
         t_minus[i] -= eps
         numerical_grad[i] = (compute_loss(t_plus).item() - compute_loss(t_minus).item()) / (2 * eps)
 
@@ -97,24 +99,25 @@ def test_camera_translation_gradient_numerical():
 def test_camera_rotation_gradient_numerical():
     """Compare autodiff rotation gradient with finite differences."""
     torch.manual_seed(42)
-    eps = 1e-4
+    eps = 1e-7
+    dtype = torch.float64
 
-    means = torch.randn(50, 3)
-    quats = F.normalize(torch.randn(50, 4), dim=-1)
-    scales = torch.rand(50, 3) * 0.1
-    cam_t = torch.tensor([0.0, 0.0, 3.0])
+    means = torch.randn(50, 3, dtype=dtype)
+    quats = F.normalize(torch.randn(50, 4, dtype=dtype), dim=-1)
+    scales = torch.rand(50, 3, dtype=dtype) * 0.1
+    cam_t = torch.tensor([0.0, 0.0, 3.0], dtype=dtype)
 
     def compute_loss(q):
         means_cam, quats_cam, _ = transform_to_camera(means, quats, scales, q, cam_t)
         return (means_cam ** 2).sum() + (quats_cam ** 2).sum()
 
-    cam_q = torch.tensor([1.0, 0.1, -0.05, 0.2], requires_grad=True)
+    cam_q = torch.tensor([1.0, 0.1, -0.05, 0.2], dtype=dtype, requires_grad=True)
     loss = compute_loss(cam_q)
     loss.backward()
     autodiff_grad = cam_q.grad.clone()
 
     # Finite differences
-    numerical_grad = torch.zeros(4)
+    numerical_grad = torch.zeros(4, dtype=dtype)
     for i in range(4):
         q_plus = cam_q.data.clone()
         q_plus[i] += eps
