@@ -81,6 +81,8 @@ def train(args):
         raise ValueError(f"Input not found: {args.input}")
 
     num_cameras = len(frames_full)
+    if num_cameras < 2:
+        raise ValueError(f"Need at least 2 frames, got {num_cameras}. Check input path and file extensions.")
     h_full, w_full = frames_full[0].shape[:2]
     print(f"Loaded {num_cameras} frames at {w_full}x{h_full}")
 
@@ -280,6 +282,7 @@ def train(args):
     # Save camera poses as JSON
     cameras.reanchor()
     viewmats = cameras.viewmats().detach().cpu()
+    print(f"Exporting {num_cameras} cameras (viewmats shape: {viewmats.shape})")
     cam_data = []
     for i in range(num_cameras):
         R = viewmats[i, :3, :3]
@@ -306,31 +309,33 @@ def train(args):
 
 
 def rotation_matrix_to_quaternion(R: torch.Tensor) -> torch.Tensor:
-    """Convert [3,3] rotation matrix to [w,x,y,z] quaternion."""
-    trace = R[0, 0] + R[1, 1] + R[2, 2]
-    if trace > 0:
-        s = 0.5 / (trace + 1.0).sqrt()
-        w = 0.25 / s
-        x = (R[2, 1] - R[1, 2]) * s
-        y = (R[0, 2] - R[2, 0]) * s
-        z = (R[1, 0] - R[0, 1]) * s
-    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
-        s = 2.0 * (1.0 + R[0, 0] - R[1, 1] - R[2, 2]).sqrt()
-        w = (R[2, 1] - R[1, 2]) / s
+    """Convert [3,3] rotation matrix to [w,x,y,z] quaternion. Numerically robust."""
+    # Shepperd's method: pick the largest diagonal element for stability
+    diag = torch.stack([R[0,0], R[1,1], R[2,2], R.trace()])
+    idx = diag.argmax().item()
+    if idx == 3:  # trace is largest
+        s = (1.0 + R.trace()).clamp(min=1e-8).sqrt() * 2
+        w = 0.25 * s
+        x = (R[2,1] - R[1,2]) / s
+        y = (R[0,2] - R[2,0]) / s
+        z = (R[1,0] - R[0,1]) / s
+    elif idx == 0:
+        s = (1.0 + R[0,0] - R[1,1] - R[2,2]).clamp(min=1e-8).sqrt() * 2
+        w = (R[2,1] - R[1,2]) / s
         x = 0.25 * s
-        y = (R[0, 1] + R[1, 0]) / s
-        z = (R[0, 2] + R[2, 0]) / s
-    elif R[1, 1] > R[2, 2]:
-        s = 2.0 * (1.0 + R[1, 1] - R[0, 0] - R[2, 2]).sqrt()
-        w = (R[0, 2] - R[2, 0]) / s
-        x = (R[0, 1] + R[1, 0]) / s
+        y = (R[0,1] + R[1,0]) / s
+        z = (R[0,2] + R[2,0]) / s
+    elif idx == 1:
+        s = (1.0 + R[1,1] - R[0,0] - R[2,2]).clamp(min=1e-8).sqrt() * 2
+        w = (R[0,2] - R[2,0]) / s
+        x = (R[0,1] + R[1,0]) / s
         y = 0.25 * s
-        z = (R[1, 2] + R[2, 1]) / s
+        z = (R[1,2] + R[2,1]) / s
     else:
-        s = 2.0 * (1.0 + R[2, 2] - R[0, 0] - R[1, 1]).sqrt()
-        w = (R[1, 0] - R[0, 1]) / s
-        x = (R[0, 2] + R[2, 0]) / s
-        y = (R[1, 2] + R[2, 1]) / s
+        s = (1.0 + R[2,2] - R[0,0] - R[1,1]).clamp(min=1e-8).sqrt() * 2
+        w = (R[1,0] - R[0,1]) / s
+        x = (R[0,2] + R[2,0]) / s
+        y = (R[1,2] + R[2,1]) / s
         z = 0.25 * s
     return torch.tensor([w, x, y, z])
 
