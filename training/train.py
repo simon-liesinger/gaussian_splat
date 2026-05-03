@@ -102,27 +102,74 @@ def train(args):
         stages.append(stage)
     print(f"Running stages: {', '.join(s['name'] for s in stages)}")
 
+    # Run SfM to get camera poses and sparse point cloud
+    sfm_result = None
+    if not args.no_sfm:
+        try:
+            from sfm import run_sfm
+            input_dir = args.input if os.path.isdir(args.input) else os.path.dirname(args.input)
+            sfm_result = run_sfm(input_dir, device=device)
+        except Exception as e:
+            print(f"SfM failed ({e}), falling back to random cameras")
+
     # Initialize model
-    print(f"Initializing {args.num_gaussians} gaussians and {num_cameras} cameras...")
-    try:
-        model = GaussianModel.from_images(
-            frames_full, num_gaussians=args.num_gaussians, device=device,
-        )
-        print(f"Initialized splat colors from image k-means")
-    except Exception as e:
-        print(f"Color init failed ({e}), using random init")
-        model = GaussianModel(
-            num_gaussians=args.num_gaussians,
-            sh_degree=0,
+    if sfm_result and len(sfm_result["points3d"]) > 0:
+        # Initialize splats from SfM point cloud
+        pts = sfm_result["points3d"]
+        cols = sfm_result["point_colors"]
+        n_pts = len(pts)
+        n_use = min(args.num_gaussians, n_pts)
+        print(f"Initializing {n_use} gaussians from {n_pts} SfM points")
+
+        # Subsample if we have more points than gaussians
+        if n_pts > n_use:
+            indices = np.random.choice(n_pts, n_use, replace=False)
+            pts = pts[indices]
+            cols = cols[indices]
+
+        model = GaussianModel(n_use, sh_degree=0, device=device)
+        model.means.data = torch.tensor(pts, dtype=torch.float32, device=device)
+
+        # Set colors from point cloud
+        colors_01 = torch.tensor(cols / 255.0, dtype=torch.float32, device=device).clamp(0.01, 0.99)
+        model.sh_coeffs.data[:, 0, :] = torch.log(colors_01 / (1 - colors_01))
+
+        # Small initial scale based on point cloud density
+        from scipy.spatial import KDTree
+        tree = KDTree(pts)
+        dists, _ = tree.query(pts, k=min(4, n_use))
+        avg_nn_dist = dists[:, 1:].mean(axis=1)  # skip self
+        log_scales = torch.tensor(np.log(avg_nn_dist * 0.5 + 1e-6), dtype=torch.float32, device=device)
+        model.scales_raw.data = log_scales.unsqueeze(-1).expand(n_use, 3).clone()
+    else:
+        print(f"Initializing {args.num_gaussians} gaussians randomly")
+        try:
+            model = GaussianModel.from_images(
+                frames_full, num_gaussians=args.num_gaussians, device=device,
+            )
+            print(f"Initialized splat colors from image k-means")
+        except Exception as e:
+            print(f"Color init failed ({e}), using random init")
+            model = GaussianModel(
+                num_gaussians=args.num_gaussians,
+                sh_degree=0,
+                device=device,
+            )
+
+    # Initialize cameras
+    if sfm_result and len(sfm_result["cameras"]) == num_cameras:
+        # Use SfM camera poses
+        init_poses = torch.tensor(np.array(sfm_result["cameras"]), dtype=torch.float32)
+        cameras = CameraSet(init_poses, device=device)
+        print(f"Initialized cameras from SfM poses")
+    else:
+        cameras = CameraSet.init_sequential_arc(
+            num_cameras=num_cameras,
+            radius=3.0,
+            arc_degrees=120.0,
             device=device,
         )
-
-    cameras = CameraSet.init_sequential_arc(
-        num_cameras=num_cameras,
-        radius=3.0,
-        arc_degrees=120.0,
-        device=device,
-    )
+        print(f"Initialized cameras on sequential arc")
 
     densifier = DensificationController(
         grad_threshold=args.densify_grad_threshold,
@@ -152,14 +199,30 @@ def train(args):
             target_images.append(t)
 
         width, height = res, res
-        fx, fy, cx, cy = estimate_intrinsics(width, height)
 
-        K = torch.tensor([
-            [fx, 0, cx],
-            [0, fy, cy],
-            [0,  0,  1],
-        ], device=device, dtype=torch.float32)
-        Ks = K.unsqueeze(0).expand(num_cameras, -1, -1)
+        if sfm_result and sfm_result["intrinsics"]:
+            # Scale SfM intrinsics to current resolution
+            scale_x = res / w_full
+            scale_y = res / h_full
+            Ks_list = []
+            for sfx, sfy, scx, scy in sfm_result["intrinsics"]:
+                K_i = torch.tensor([
+                    [sfx * scale_x, 0, scx * scale_x],
+                    [0, sfy * scale_y, scy * scale_y],
+                    [0, 0, 1],
+                ], device=device, dtype=torch.float32)
+                Ks_list.append(K_i)
+            Ks = torch.stack(Ks_list)
+            fx, fy = sfm_result["intrinsics"][0][0] * scale_x, sfm_result["intrinsics"][0][1] * scale_y
+            cx, cy = sfm_result["intrinsics"][0][2] * scale_x, sfm_result["intrinsics"][0][3] * scale_y
+        else:
+            fx, fy, cx, cy = estimate_intrinsics(width, height)
+            K = torch.tensor([
+                [fx, 0, cx],
+                [0, fy, cy],
+                [0,  0,  1],
+            ], device=device, dtype=torch.float32)
+            Ks = K.unsqueeze(0).expand(num_cameras, -1, -1)
 
         pos_lr = 1.6e-4 * stage["gauss_lr_scale"]
         g_opt = make_gaussian_optimizer(model, position_lr=pos_lr)
@@ -381,6 +444,7 @@ def main():
     parser.add_argument("--save-interval", type=int, default=500, help="Save snapshot every N iterations")
     parser.add_argument("--stages", default="A,B,C", help="Comma-separated stages to run: A (warmup), B (joint), C (detail)")
     parser.add_argument("--views-per-iter", type=int, default=3, help="Number of views rendered per iteration for 3D consistency")
+    parser.add_argument("--no-sfm", action="store_true", help="Skip SfM, use random camera init")
     args = parser.parse_args()
 
     if rasterization is None:
