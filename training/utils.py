@@ -63,7 +63,7 @@ def load_images(
     exts = {".jpg", ".jpeg", ".png", ".bmp", ".tiff"}
     paths = sorted(
         p for p in Path(image_dir).iterdir()
-        if p.suffix.lower() in exts
+        if p.suffix.lower() in exts and not p.name.startswith("._")
     )
 
     frames = []
